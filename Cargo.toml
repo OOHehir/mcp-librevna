@@ -1,0 +1,24 @@
+[package]
+name = "mcp-librevna"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Model Context Protocol (MCP) server for the LibreVNA 100kHz-6GHz 2-port vector network analyser - sweeps, calibration, spectrum analysis and signal generation from an MCP client."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/OOHehir/mcp-librevna"
+authors = ["OOHehir <40183643+OOHehir@users.noreply.github.com>"]
+keywords = ["mcp", "librevna", "vna", "rf", "s-parameters"]
+categories = ["command-line-utilities", "science", "hardware-support"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+rmcp = { version = "3.2", features = ["server", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "net", "time", "process", "sync", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
