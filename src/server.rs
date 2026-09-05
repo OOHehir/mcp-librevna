@@ -22,10 +22,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::analysis;
+use crate::autocal;
 use crate::calibration::{CalValidity, SweepConfig};
 use crate::device::{DeviceLimits, Mode, StatusFlags};
 use crate::error::{Tier, VnaError};
 use crate::instrument::Instrument;
+use crate::librecal;
 use crate::safety::Policy;
 use crate::scpi::parse::{self, Identity};
 
@@ -113,6 +115,24 @@ pub struct ConfigureSweepArgs {
     /// Logarithmic frequency spacing instead of linear.
     #[serde(default)]
     pub logarithmic: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AutoCalArgs {
+    /// Coefficient set to take the standard definitions from. Defaults to the
+    /// module's factory set, which is the only one most units carry.
+    #[serde(default)]
+    pub coefficient_set: Option<String>,
+    /// Seconds allowed for each sweep and calibration step.
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LibreCalVerifyArgs {
+    /// Seconds allowed for each sweep in the check.
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -367,6 +387,92 @@ pub struct CalStatusResult {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+pub struct LibreCalStatusResult {
+    /// Whether a module is attached at all. False is normal: it is optional.
+    pub present: bool,
+    pub path: Option<String>,
+    pub serial: Option<String>,
+    pub firmware: Option<String>,
+    pub ports: Option<u8>,
+    pub temperature_c: Option<f64>,
+    /// The oven has settled. Factory coefficients only hold once it has.
+    pub temperature_stable: Option<bool>,
+    pub heater_power_w: Option<f64>,
+    pub coefficient_sets: Vec<String>,
+    /// What each port is currently terminated into, in port order.
+    pub port_standards: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// What one module port's LOAD sweep showed about the wiring.
+enum PortProbe {
+    /// Exactly one VNA port absorbed, giving the mapping and its reading.
+    Mapped(u8, f64),
+    /// Both VNA ports absorbed, which no single connection explains.
+    Ambiguous,
+    /// Neither did, so nothing is attached to this module port.
+    NoResponse,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PortCheckResult {
+    pub cal_port: u8,
+    /// Which VNA port this module port turned out to be wired to, discovered
+    /// rather than assumed. Absent when nothing responded.
+    pub vna_port: Option<u8>,
+    pub load_db: Option<f64>,
+    pub open_db: Option<f64>,
+    pub short_db: Option<f64>,
+    /// How far the reading moved between LOAD and OPEN. This is the figure
+    /// that separates a module under our control from a fixed termination.
+    pub change_db: Option<f64>,
+    pub verdict: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LibreCalVerifyResult {
+    pub ok: bool,
+    pub serial: String,
+    pub temperature_c: f64,
+    pub temperature_stable: bool,
+    pub ports: Vec<PortCheckResult>,
+    /// The discovered wiring, as `cal port N -> VNA port M`.
+    pub mapping: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AutoCalResult {
+    pub ok: bool,
+    pub serial: String,
+    pub coefficient_set: String,
+    pub cal_type: String,
+    /// The wiring the calibration was taken against, discovered not assumed.
+    pub mapping: Vec<String>,
+    /// The connection check that ran first. A calibration is only attempted
+    /// once every mapped port proves controllable.
+    pub checks: Vec<PortCheckResult>,
+    /// The module's coefficients as installed into the GUI's calibration kit.
+    pub standards: Vec<crate::autocal::InstalledStandard>,
+    /// Where the calibration kit this replaced was saved, if one was loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_kit: Option<String>,
+    pub steps: Vec<crate::autocal::CalStep>,
+    /// Each standard re-measured through the finished calibration and compared
+    /// against its own definition. This is what distinguishes a calibration
+    /// that completed from one that is right.
+    pub residuals: Vec<crate::autocal::ResidualCheck>,
+    pub calibration: CalValidity,
+    pub sweep: SweepConfig,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct RawResult {
     pub command: String,
     pub response: Option<String>,
@@ -395,6 +501,148 @@ impl LibreVnaServer {
         .filter(|t| self.policy.allows(*t))
         .map(|t| t.to_string())
         .collect()
+    }
+
+    /// Mean magnitude of one trace, or None if it is not defined.
+    ///
+    /// A missing trace is not an error here: the check reads both reflection
+    /// parameters to discover the wiring, and a device configured with only one
+    /// of them should narrow the answer rather than fail it.
+    async fn mean_db(instrument: &mut Instrument, trace: &str) -> Option<f64> {
+        let points = instrument.read_vna_trace(trace).await.ok()?;
+        analysis::mean_magnitude_db(&points)
+    }
+
+    /// Measure every module port into LOAD, then OPEN, then SHORT.
+    ///
+    /// Returns the per-port findings, the wiring discovered along the way, and
+    /// anything the caller should be told about. Shared by `librecal_verify`
+    /// and the automatic calibration, so a calibration cannot proceed on a
+    /// looser check than the one reported.
+    async fn check_ports(
+        instrument: &mut Instrument,
+        cal: &mut librecal::LibreCal,
+        ports: u8,
+        timeout: Duration,
+    ) -> Result<(Vec<PortCheckResult>, Vec<String>, Vec<String>), VnaError> {
+        let mut checks = Vec::new();
+        let mut mapping = Vec::new();
+        let mut warnings = Vec::new();
+
+        for cal_port in 1..=ports {
+            // LOAD first. Both reflection parameters are read from this single
+            // sweep, so whichever one drops identifies the wiring for free.
+            cal.set_standard(cal_port, librecal::Standard::Load).await?;
+            instrument.run_sweep(timeout).await?;
+
+            let s11 = Self::mean_db(instrument, "S11").await;
+            let s22 = Self::mean_db(instrument, "S22").await;
+
+            let probe = match (s11, s22) {
+                (Some(a), Some(b)) if a < librecal::MAX_LOAD_DB && b < librecal::MAX_LOAD_DB => {
+                    PortProbe::Ambiguous
+                }
+                (Some(a), _) if a < librecal::MAX_LOAD_DB => PortProbe::Mapped(1, a),
+                (_, Some(b)) if b < librecal::MAX_LOAD_DB => PortProbe::Mapped(2, b),
+                _ => PortProbe::NoResponse,
+            };
+
+            let (vna_port, load_db) = match probe {
+                PortProbe::Mapped(port, db) => (port, db),
+                other => {
+                    cal.set_standard(cal_port, librecal::Standard::None).await?;
+                    // A spare port on a 4-port module is expected; two VNA ports answering
+                    // one is a setup nobody should calibrate against.
+                    let (verdict, ok, detail) = match other {
+                        PortProbe::Ambiguous => (
+                            "ambiguous",
+                            false,
+                            format!(
+                                "Setting cal port {cal_port} to LOAD made both VNA ports \
+                                 absorb, which no single connection explains. Check for a \
+                                 second termination or a splitter before calibrating."
+                            ),
+                        ),
+                        _ => (
+                            "unused",
+                            true,
+                            format!(
+                                "No VNA port responded to cal port {cal_port}, so nothing \
+                                 is connected to it."
+                            ),
+                        ),
+                    };
+                    if !ok {
+                        warnings.push(detail.clone());
+                    }
+                    checks.push(PortCheckResult {
+                        cal_port,
+                        vna_port: None,
+                        load_db: None,
+                        open_db: None,
+                        short_db: None,
+                        change_db: None,
+                        verdict: verdict.into(),
+                        ok,
+                        detail,
+                    });
+                    continue;
+                }
+            };
+
+            let param = if vna_port == 1 { "S11" } else { "S22" };
+
+            cal.set_standard(cal_port, librecal::Standard::Open).await?;
+            instrument.run_sweep(timeout).await?;
+            let open_db = Self::mean_db(instrument, param).await;
+
+            // SHORT proves the third switch state responds; it is no threshold,
+            // sitting within about 2 dB of OPEN with only phase between them.
+            cal.set_standard(cal_port, librecal::Standard::Short)
+                .await?;
+            instrument.run_sweep(timeout).await?;
+            let short_db = Self::mean_db(instrument, param).await;
+
+            cal.set_standard(cal_port, librecal::Standard::None).await?;
+
+            let verdict = match open_db {
+                Some(open) => librecal::assess_port(load_db, open),
+                None => librecal::PortVerdict::Inconclusive,
+            };
+            if verdict.is_ok() {
+                mapping.push(format!("cal port {cal_port} -> VNA port {vna_port}"));
+            }
+            checks.push(PortCheckResult {
+                cal_port,
+                vna_port: Some(vna_port),
+                load_db: Some(load_db),
+                open_db,
+                short_db,
+                change_db: open_db.map(|o| o - load_db),
+                verdict: format!("{verdict:?}"),
+                ok: verdict.is_ok(),
+                detail: verdict.explain().to_string(),
+            });
+        }
+
+        Ok((checks, mapping, warnings))
+    }
+
+    /// Mean magnitude of a trace across the whole sweep, in dB.
+    ///
+    /// The same statistic the connection check judges on, exposed so the
+    /// hardware examples can ask whether a calibration actually corrects
+    /// rather than only whether its commands succeeded.
+    pub async fn trace_mean_db(&self, trace: &str) -> Result<f64, ErrorData> {
+        let mut guard = self.instrument.lock().await;
+        let instrument = guard
+            .as_mut()
+            .ok_or_else(|| mcp_err(VnaError::NotConnected))?;
+        Self::mean_db(instrument, trace).await.ok_or_else(|| {
+            mcp_err(VnaError::InvalidRequest(format!(
+                "trace {trace} is not defined or returned no points"
+            )))
+        })
     }
 
     /// Collect every reason the caller should hesitate over a result.
@@ -925,6 +1173,303 @@ impl LibreVnaServer {
             traces: args.traces,
             warnings: calibration.warning().into_iter().collect(),
             calibration,
+        }))
+    }
+
+    #[tool(
+        description = "Report whether a LibreCAL electronic calibration module is attached, \
+                       and if so its serial, firmware, oven temperature and stability, and \
+                       what each of its ports is currently terminated into. The module is \
+                       optional; reporting that none is present is a normal answer, not a \
+                       failure."
+    )]
+    pub async fn librecal_status(&self) -> Result<Json<LibreCalStatusResult>, ErrorData> {
+        // The instrument mutex is the only thing serialising tools, and a second
+        // open of the module's port mid-calibration would race one stream.
+        let _serialise = self.instrument.lock().await;
+        let found = librecal::discover();
+        let Some(module) = found.first() else {
+            return Ok(Json(LibreCalStatusResult {
+                present: false,
+                path: None,
+                serial: None,
+                firmware: None,
+                ports: None,
+                temperature_c: None,
+                temperature_stable: None,
+                heater_power_w: None,
+                coefficient_sets: Vec::new(),
+                port_standards: Vec::new(),
+                warning: Some(
+                    "No LibreCAL module attached. Calibration with manual standards is \
+                     unaffected."
+                        .into(),
+                ),
+            }));
+        };
+
+        let (mut cal, identity) = librecal::LibreCal::open(&module.path, self.config.timeout)
+            .await
+            .map_err(mcp_err)?;
+
+        let ports = cal.port_count().await.map_err(mcp_err)?;
+        let temperature_c = cal.temperature_c().await.map_err(mcp_err)?;
+        let stable = cal.temperature_stable().await.map_err(mcp_err)?;
+        let heater_power_w = cal.heater_power_w().await.ok();
+        let coefficient_sets = cal.coefficient_sets().await.unwrap_or_default();
+
+        let mut port_standards = Vec::with_capacity(ports as usize);
+        for port in 1..=ports {
+            let state = cal.standard(port).await.map_err(mcp_err)?;
+            port_standards.push(state.to_string());
+        }
+
+        Ok(Json(LibreCalStatusResult {
+            present: true,
+            path: Some(cal.path().to_string()),
+            serial: Some(identity.serial),
+            firmware: Some(identity.firmware),
+            ports: Some(ports),
+            temperature_c: Some(temperature_c),
+            temperature_stable: Some(stable),
+            heater_power_w,
+            coefficient_sets,
+            port_standards,
+            warning: (!stable).then(|| {
+                "The oven has not settled. The factory coefficients only hold at the \
+                 regulated temperature, so wait for temperature_stable before calibrating."
+                    .to_string()
+            }),
+        }))
+    }
+
+    #[tool(
+        description = "Check that the LibreCAL is really connected to the VNA's RF ports and \
+                       responding to commands, and discover which module port is wired to \
+                       which VNA port. Each port is measured terminated into LOAD, then OPEN, \
+                       then SHORT. It is the change between LOAD and OPEN that carries the \
+                       proof: a bare port and a fixed 50 ohm termination each hold still under \
+                       both commands, and only a module under our control moves. Run this \
+                       before calibrating."
+    )]
+    pub async fn librecal_verify(
+        &self,
+        Parameters(args): Parameters<LibreCalVerifyArgs>,
+    ) -> Result<Json<LibreCalVerifyResult>, ErrorData> {
+        let mut guard = self.instrument.lock().await;
+        let instrument = guard
+            .as_mut()
+            .ok_or_else(|| mcp_err(VnaError::NotConnected))?;
+
+        let (mut cal, identity) = librecal::LibreCal::open_first(self.config.timeout)
+            .await
+            .map_err(mcp_err)?;
+
+        let timeout = args
+            .timeout_s
+            .map(Duration::from_secs)
+            .unwrap_or(self.config.sweep_timeout);
+        let ports = cal.port_count().await.map_err(mcp_err)?;
+        let temperature_c = cal.temperature_c().await.map_err(mcp_err)?;
+        let temperature_stable = cal.temperature_stable().await.map_err(mcp_err)?;
+
+        instrument.set_mode(Mode::Vna).await.map_err(mcp_err)?;
+        // Start from a known state so a termination left over from earlier work
+        // cannot be read as this check's result.
+        cal.clear_all(ports).await.map_err(mcp_err)?;
+
+        let (checks, mapping, mut warnings) =
+            Self::check_ports(instrument, &mut cal, ports, timeout)
+                .await
+                .map_err(mcp_err)?;
+
+        cal.clear_all(ports).await.map_err(mcp_err)?;
+        instrument.stop_acquisition().await.map_err(mcp_err)?;
+
+        if !temperature_stable {
+            warnings.push(
+                "The LibreCAL oven has not settled, so its factory coefficients do not yet \
+                 hold. Wait for temperature_stable before calibrating."
+                    .into(),
+            );
+        }
+        if !checks.iter().any(|c| c.vna_port.is_some()) {
+            warnings.push(
+                "No module port reached any VNA port. Check the RF cables before going \
+                 further."
+                    .into(),
+            );
+        }
+
+        Ok(Json(LibreCalVerifyResult {
+            ok: checks.iter().all(|c| c.ok) && checks.iter().any(|c| c.vna_port.is_some()),
+            serial: identity.serial,
+            temperature_c,
+            temperature_stable,
+            ports: checks,
+            mapping,
+            warnings,
+        }))
+    }
+
+    #[tool(
+        description = "Calibrate the VNA automatically using an attached LibreCAL module. \
+                       Checks the module is really cabled to the RF ports and discovers which \
+                       module port feeds which VNA port, installs the module's own factory \
+                       coefficients into the calibration kit so the standards are corrected \
+                       for what they actually are rather than treated as ideal, then measures \
+                       open, short and load at each port and a through across the pair, and \
+                       activates the result. Writes the coefficient files into the working \
+                       directory, discards any existing calibration and replaces the loaded \
+                       calibration kit (saving it first), so it needs the destructive tier."
+    )]
+    pub async fn vna_cal_auto(
+        &self,
+        Parameters(args): Parameters<AutoCalArgs>,
+    ) -> Result<Json<AutoCalResult>, ErrorData> {
+        self.policy
+            .require(Tier::Destructive, "vna_cal_auto")
+            .map_err(|e| mcp_err(VnaError::Safety(e)))?;
+
+        let mut guard = self.instrument.lock().await;
+        let instrument = guard
+            .as_mut()
+            .ok_or_else(|| mcp_err(VnaError::NotConnected))?;
+
+        let (mut cal, identity) = librecal::LibreCal::open_first(self.config.timeout)
+            .await
+            .map_err(mcp_err)?;
+
+        let timeout = args
+            .timeout_s
+            .map(Duration::from_secs)
+            .unwrap_or(self.config.sweep_timeout);
+        let set = args.coefficient_set.unwrap_or_else(|| "FACTORY".into());
+
+        let available = cal.coefficient_sets().await.map_err(mcp_err)?;
+        if !available.iter().any(|s| s.eq_ignore_ascii_case(&set)) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "the module holds no coefficient set named {set:?}; it has {}",
+                    available.join(", ")
+                ),
+                None,
+            ));
+        }
+
+        // The coefficients describe the standards at the regulated temperature, so
+        // calibrating before the oven settles is wrong by an unseeable amount.
+        let ports = cal.port_count().await.map_err(mcp_err)?;
+        let temperature_c = cal.temperature_c().await.map_err(mcp_err)?;
+        if !cal.temperature_stable().await.map_err(mcp_err)? {
+            return Err(mcp_err(VnaError::InvalidRequest(format!(
+                "the LibreCAL oven has not settled (currently {temperature_c:.1} C), so its \
+                 factory coefficients do not yet describe the standards. Wait for \
+                 librecal_status to report temperature_stable before calibrating"
+            ))));
+        }
+
+        instrument.set_mode(Mode::Vna).await.map_err(mcp_err)?;
+        cal.clear_all(ports).await.map_err(mcp_err)?;
+
+        let (checks, mapping, mut warnings) =
+            Self::check_ports(instrument, &mut cal, ports, timeout)
+                .await
+                .map_err(mcp_err)?;
+
+        // A port that failed the check would calibrate against whatever is on the
+        // end of the cable, which is the failure this path exists to prevent.
+        let pairs: Vec<autocal::PortPair> = checks
+            .iter()
+            .filter(|c| c.ok && c.vna_port.is_some())
+            .map(|c| autocal::PortPair {
+                cal_port: c.cal_port,
+                vna_port: c.vna_port.expect("filtered to mapped ports"),
+            })
+            .collect();
+
+        if pairs.is_empty() {
+            instrument.stop_acquisition().await.map_err(mcp_err)?;
+            return Err(mcp_err(VnaError::InvalidRequest(
+                "no LibreCAL port is both connected to a VNA port and switching under \
+                 command, so there is nothing to calibrate against. Run librecal_verify \
+                 for the per-port detail"
+                    .into(),
+            )));
+        }
+        if pairs.len() == 1 {
+            warnings.push(
+                "Only one port is connected, so this is a one-port calibration: no through \
+                 was measured and transmission readings stay uncorrected."
+                    .into(),
+            );
+        }
+
+        let dir = autocal::standards_dir(&self.policy, &identity.serial)
+            .map_err(|e| mcp_err(VnaError::Safety(e)))?;
+        let kit = autocal::install_kit(instrument, &mut cal, &identity, &set, &pairs, &dir)
+            .await
+            .map_err(mcp_err)?;
+        let standards = kit.standards;
+        if let Some(path) = &kit.replaced_kit {
+            warnings.push(format!(
+                "The calibration kit that was loaded has been replaced by the module's \
+                 coefficients. The previous one was saved to {path}."
+            ));
+        }
+        let steps =
+            autocal::calibrate_solt(instrument, &mut cal, &identity, &pairs, ports, timeout)
+                .await
+                .map_err(mcp_err)?;
+
+        let cal_type = autocal::calibration_type(&pairs);
+        let cal_type = autocal::activate(instrument, &cal_type)
+            .await
+            .map_err(mcp_err)?;
+        instrument.refresh_calibration().await.map_err(mcp_err)?;
+
+        let calibration = instrument.calibration_validity().await.map_err(mcp_err)?;
+        let sweep = instrument.current_sweep().await.map_err(mcp_err)?;
+
+        let residuals = autocal::verify_residuals(
+            instrument, &mut cal, &standards, &pairs, ports, &sweep, timeout,
+        )
+        .await
+        .map_err(mcp_err)?;
+        instrument.stop_acquisition().await.map_err(mcp_err)?;
+
+        if !calibration.is_trustworthy() {
+            warnings.push(format!(
+                "The calibration did not come out valid for the current sweep: {calibration:?}"
+            ));
+        }
+        for r in residuals.iter().filter(|r| !r.ok) {
+            warnings.push(format!(
+                "{} reads {:.2} dB through the calibration but its own coefficients say \
+                 {:.2} dB, a {:.2} dB discrepancy. The calibration is not using the \
+                 module's real standard definitions.",
+                r.standard, r.measured_db, r.expected_db, r.deviation_db
+            ));
+        }
+
+        Ok(Json(AutoCalResult {
+            // `all` is true of an empty list, so emptiness is checked separately:
+            // nothing verified is not the same as everything passed.
+            ok: calibration.is_trustworthy()
+                && !residuals.is_empty()
+                && residuals.iter().all(|r| r.ok),
+            serial: identity.serial,
+            coefficient_set: set,
+            cal_type,
+            mapping,
+            checks,
+            standards,
+            replaced_kit: kit.replaced_kit,
+            steps,
+            residuals,
+            calibration,
+            sweep,
+            warnings,
         }))
     }
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0
+
+- Added `librecal_status`, reporting an attached LibreCAL's firmware, oven temperature, stability and port states
+- Added `librecal_verify`, which proves the LibreCAL is cabled to the RF ports and switching under command before anything is calibrated
+- Added `vna_cal_auto`, a full SOLT calibration driven from a LibreCAL, using the module's own factory coefficients instead of ideal standards
+- `librecal_verify` reports which module port feeds which VNA port, so a swapped pair is caught rather than calibrated against
+- `librecal_verify` fails a module port that makes both VNA ports absorb, instead of reporting it as unused
+- `vna_cal_auto` re-measures every standard through the finished calibration and compares it against its own coefficients, and fails if any comparison cannot be made
+- `vna_cal_auto` saves the calibration kit it replaces to `librecal-standards/<serial>/replaced-kit-<timestamp>.calkit` and reports the path. **Note:** the kit loaded in the GUI is replaced wholesale
+- Fixed `vna_cal_measure` recording whatever was connected next instead of the standard asked for, when the standard was disconnected promptly after the call returned
+- The LibreCAL is optional throughout: with no module attached, every existing tool behaves as before
+
 ## 0.1.0
 
 - Added `librevna_connect`, `librevna_status` and `librevna_list_devices` to attach to a LibreVNA through LibreVNA-GUI and report the unit's own limits

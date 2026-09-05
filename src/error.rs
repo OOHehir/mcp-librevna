@@ -37,6 +37,24 @@ pub enum VnaError {
     #[error("{0}")]
     InvalidRequest(String),
 
+    /// No LibreCAL module is attached.
+    ///
+    /// Not a fault: the module is optional, and every tool needing one says so
+    /// rather than failing obscurely.
+    #[error(
+        "no LibreCAL module found on USB (looked for {vid:04x}:{pid:04x}). \
+         Attach one, or calibrate with manual standards instead."
+    , vid = crate::librecal::USB_VID, pid = crate::librecal::USB_PID)]
+    NoLibreCal,
+
+    /// The LibreCAL is attached but could not be talked to.
+    #[error("LibreCAL is not usable: {reason}")]
+    LibreCalUnavailable { reason: String },
+
+    /// The module answered `ERROR`, or a set did not read back as commanded.
+    #[error("LibreCAL rejected `{0}`")]
+    LibreCalRefused(String),
+
     /// LibreVNA-GUI is not reachable.
     #[error("LibreVNA-GUI is not reachable on {addr}: {reason}")]
     GuiUnavailable { addr: String, reason: String },

@@ -85,6 +85,25 @@ pub fn vswr_from_db(magnitude_db: f64) -> f64 {
 }
 
 /// Locate the lowest-magnitude point of a trace.
+/// Mean magnitude across a trace, in dB.
+///
+/// The mean is taken over linear magnitudes and converted once at the end,
+/// rather than averaging decibels. Averaging dB weights a single deep null far
+/// more heavily than it deserves, which for a connection check would let one
+/// sharp resonance masquerade as a well-matched load across the whole band.
+pub fn mean_magnitude_db(points: &[ComplexPoint]) -> Option<f64> {
+    if points.is_empty() {
+        return None;
+    }
+    let sum: f64 = points.iter().map(|p| p.re.hypot(p.im)).sum();
+    let mean = sum / points.len() as f64;
+    Some(if mean <= 0.0 {
+        crate::scpi::parse::FLOOR_DB
+    } else {
+        20.0 * mean.log10()
+    })
+}
+
 pub fn find_minimum(points: &[ComplexPoint]) -> Option<Extreme> {
     points
         .iter()

@@ -50,6 +50,9 @@ single client, so a second GUI would fight the first for the device.
 | `vna_cal_measure` | measure | Measure one calibration standard |
 | `vna_cal_activate` | measure | Activate a calibration type, e.g. SOLT |
 | `vna_cal_load` | measure | Load a calibration from the working directory |
+| `librecal_status` | — | Report an attached LibreCAL: firmware, oven temperature, port states |
+| `librecal_verify` | measure | Prove the LibreCAL is cabled to the VNA and switching, and find the wiring |
+| `vna_cal_auto` | destructive | Full SOLT calibration from a LibreCAL, using its own factory coefficients |
 | `sa_configure` | measure | Span, RBW, window, detector, averaging |
 | `sa_sweep` | measure | Run one spectrum sweep |
 | `sa_read` | measure | Peak table plus an estimated noise floor |
@@ -198,6 +201,107 @@ blank line is the only reliable end marker. It is also answered only for a compl
 N-port matrix of traces: one trace or four, never two — an incomplete set gets silence,
 so `vna_export_touchstone` rejects one before transmitting.
 
+### The LibreCAL module
+
+The optional [LibreCAL](https://github.com/jankae/LibreCAL) eCal module is driven
+directly over its USB CDC-ACM interface rather than through LibreVNA-GUI. That is forced
+rather than chosen: the GUI's LibreCAL support lives entirely in a Qt dialog, and its
+`CALibration` SCPI node exposes nothing for it, so under `--no-gui` there is no way to
+ask the GUI to drive the module.
+
+Its framing is the **inverse** of the GUI's, which is worth holding in mind when working
+across both. Every LibreCAL exchange answers with exactly one line: an empty line for
+success, `ERROR` for a refusal, and `ERROR` for an unrecognised command too. A misspelt
+name therefore fails at once instead of costing a timeout — and silence, which on the
+GUI's SCPI port means "refused", here means the module has stopped answering. Bulk
+responses are framed by literal `START` and `END` lines rather than a blank one.
+
+Verified against firmware v0.3.0. The command set is discoverable from the module itself
+with `*LST?`, which is more trustworthy than the published PDF.
+
+### Proving the module is really connected
+
+`librecal_verify` measures each module port terminated into LOAD, then OPEN, then SHORT,
+and reports the mean reflection of each. The **change between LOAD and OPEN** is what
+carries the proof, not either level alone:
+
+| What is attached | LOAD | OPEN | Change | Verdict |
+|---|---|---|---|---|
+| The module, cabled and switching | −23.4 dB | −7.3 dB | 16.2 dB | controllable |
+| Nothing — a bare port | −6.4 dB | −6.4 dB | ~0 dB | not connected |
+| A fixed 50 Ω termination | −23.4 dB | −23.4 dB | ~0 dB | static termination |
+
+Measured uncalibrated over 100 MHz – 6 GHz. A LOAD-only check would wave the fixed
+termination through, and an OPEN-only check would pass a port with no cable at all, since
+a disconnected port *is* an open. Only the pair separates them.
+
+The same LOAD sweep reads both reflection parameters, so the wiring between module ports
+and VNA ports is discovered rather than declared — a swapped pair would otherwise produce
+a calibration that is wrong with no visible symptom.
+
+### Calibrating from the module
+
+`vna_cal_auto` runs the whole sequence: verify the connection, install the module's factory
+coefficients as the GUI's calibration kit, measure open/short/load at each port and a
+through across the pair, activate, then check its own work.
+
+Installing the kit is the part that matters. Driving the module and calling
+`VNA:CAL:MEASURE` produces a calibration either way, but with the GUI's default kit the
+standards are treated as *ideal* — a perfect open, a perfect 50 Ω load — when the real
+ones are nothing of the sort. That calibration completes cleanly, reports itself valid,
+and is quietly inaccurate. So the coefficients are fetched over serial, written as
+Touchstone into `librecal-standards/<serial>/`, loaded with `VNA:CAL:KIT:STAndard:<n>:FILE`,
+and each measurement is bound to its standard by name with `VNA:CAL:ADD <type> <name>`.
+
+Installing that kit **replaces whatever kit was loaded**, since a kit is one shared
+namespace and leaving strangers in it invites a later measurement binding to the wrong
+standard. The GUI keeps no copy, so the displaced kit is written to
+`librecal-standards/<serial>/replaced-kit-<timestamp>.calkit` first and the path is
+reported back.
+
+Three behaviours of the GUI shape this, and each fails silently:
+
+- **`VNA:CAL:MEASURE` does not measure.** It marks the entry pending; the *next* sweep
+  fills it. Disconnect the standard before that sweep and the entry records whatever
+  replaced it.
+- **`VNA:CAL:BUSy?` is not a usable handshake.** The command exists, but on v1.6.5 it
+  never reads true — sampled every 40 ms across a measurement it stays `FALSE` throughout,
+  running or stopped. Polling it returns instantly, which reads as "finished". Both
+  `vna_cal_auto` and `vna_cal_measure` drive a sweep and wait for that instead.
+- **`VNA:CAL:ACTivate` takes port-qualified type names.** `VNA:CAL:ACTivate?` reports
+  `OSL_1, OSL_2, OSL_12, SOLT_1, SOLT_2, SOLT_12, ThroughNormalization_12, TRL_12`. A bare
+  `SOLT` is not among them and is answered with silence, leaving the calibration inactive
+  while every command appears to have succeeded.
+
+### Checking the calibration is real
+
+A calibration built on ideal definitions activates and reads as valid exactly like one
+built on the module's own data, so `vna_cal_auto` finishes by re-measuring each standard
+through the finished calibration and comparing it against its own coefficients:
+
+```
+standard                             param   expected   measured  deviation
+LibreCAL_5mV8QRceRywA_P1_LOAD          S11    -19.66dB   -19.62dB     0.04dB
+LibreCAL_5mV8QRceRywA_P2_LOAD          S22    -20.11dB   -20.03dB     0.09dB
+LibreCAL_5mV8QRceRywA_P12_THROUGH      S21     -3.11dB    -3.11dB    -0.00dB
+```
+
+A corrected standard reads back as its definition, **not** as zero — the load tracking its
+real −19.66 dB reflection is the evidence the module's data is in use. Had the kit failed
+to load, the GUI would have corrected that load towards a perfect match instead, and the
+comparison would have caught it.
+
+If a standard cannot be checked — its coefficient file has gone, or the sweep has moved
+outside the range the coefficients cover — the tool fails rather than skipping it. A
+skipped check would leave nothing to disagree with, and "everything passed" and "nothing
+was checked" must not look the same.
+
+Two limits worth stating. This is self-consistency, not independent verification: these
+are the same standards the calibration was solved from, so it proves the calibration uses
+the module's data, not that the module's factory data is accurate. And a through is
+reciprocal, so S21 and S12 agree — the comparison cannot detect a transposed port order,
+which is enforced by construction instead.
+
 ## Direct smoke test
 
 `examples/smoke.rs` talks SCPI to the hardware without any MCP involved, and reports
@@ -207,12 +311,29 @@ whether this crate's response parsers agree with what the instrument actually se
 cargo run --example smoke -- 127.0.0.1:19542
 ```
 
+`examples/librecal_smoke.rs` does the same for the LibreCAL, exercising discovery,
+status and the connection check against real hardware. It leaves every module port
+released:
+
+```bash
+cargo run --example librecal_smoke
+```
+
+`examples/autocal_smoke.rs` runs a full automatic calibration and prints the residual
+comparison above. It needs the destructive tier:
+
+```bash
+cargo run --example autocal_smoke -- <workdir>
+```
+
 ## Layout
 
 | Path | Contents |
 |---|---|
 | `src/scpi/` | Transport and response parsing |
 | `src/instrument.rs` | Connection state, sweep control, trace reads |
+| `src/librecal.rs` | LibreCAL discovery, transport and the connection check |
+| `src/autocal.rs` | Calibration kit installation, the SOLT sequence and its residual check |
 | `src/safety.rs` | Capability tiers, power ceiling, path sandbox |
 | `src/device.rs` | Device-reported limits and error flags |
 | `src/calibration.rs` | Calibration validity state machine |
