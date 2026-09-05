@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- LibreVNA-GUI is now reached on the first `librevna_connect` rather than at startup. An unreachable GUI used to exit the process before the MCP handshake, so the client reported only a closed connection and the reason was lost to stderr; it is now returned as a tool error naming the address and what to do about it
+- A GUI started later in the session is picked up by the next `librevna_connect`, and a `--spawn` GUI that has since died is replaced, neither needing the MCP server restarted
+- `--spawn` now requires `--gui-path` (or `LIBREVNA_GUI_PATH`) and is refused at argument parsing without one. It could previously be registered without a path and would appear to work for as long as an unrelated GUI happened to be listening
+- Documented `--spawn` with `--gui-path` in the Claude Code setup, which removes the need to start LibreVNA-GUI by hand, and recommended registering the server at user scope so the GUI path stays on the machine it describes
+- Removed the repository's `.mcp.json`: project scope takes precedence over user scope, so shipping one silently shadowed a user's own registration with this bench's GUI path
+
 ## 0.2.0
 
 - Added `librecal_status`, reporting an attached LibreCAL's firmware, oven temperature, stability and port states

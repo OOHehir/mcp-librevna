@@ -1,2 +1,5 @@
 /target
 librecal-standards/
+
+# Registering librevna here would shadow a user-scope entry; see the README.
+.mcp.json

@@ -30,6 +30,11 @@ headless with `--no-gui`.
 with `--spawn` and `--gui-path`. Attaching is always tried first: the SCPI server accepts a
 single client, so a second GUI would fight the first for the device.
 
+Reaching the GUI is deferred to `librevna_connect` rather than checked at startup, so an
+unreachable GUI is reported as a tool error the agent can read and act on. The server
+starts regardless; starting the GUI afterwards is picked up by the next connect, with no
+need to restart the MCP server.
+
 ## Tools
 
 | Tool | Tier | What it does |
@@ -124,22 +129,52 @@ with the hardware attached.
 
 ## Use with Claude Code
 
+Register it at **user scope**, so the path to your GUI lives in your own
+`~/.claude.json` rather than in any file a repository could ship:
+
 ```bash
-claude mcp add librevna -- mcp-librevna --workdir ~/vna-work
+claude mcp add --scope user librevna -- mcp-librevna --workdir ~/vna-work \
+  --spawn --gui-path /path/to/LibreVNA-GUI
 ```
 
-Or in `claude_desktop_config.json`:
+LibreVNA-GUI is distributed as a release archive rather than a package, so it has no
+standard location — substitute wherever you unpacked yours. User scope is the right home
+for that: the path is a property of your machine, not of a project, and it then applies in
+every directory you work in. `LIBREVNA_GUI_PATH` and `LIBREVNA_SPAWN` do the same job from
+the environment if you prefer, and the flags win over both.
+
+Avoid putting this server in a project's `.mcp.json`: project scope takes precedence over
+user scope, so a checked-in entry silently shadows the registration above — with whatever
+GUI path its author happened to have. This repository ships no `.mcp.json` for that reason.
+
+Or, for Claude Desktop, in `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "librevna": {
       "command": "mcp-librevna",
-      "args": ["--workdir", "/home/you/vna-work", "--allow-destructive"]
+      "args": [
+        "--workdir", "/home/you/vna-work",
+        "--spawn", "--gui-path", "/path/to/LibreVNA-GUI",
+        "--allow-destructive"
+      ]
     }
   }
 }
 ```
+
+### Why `--spawn`
+
+Without it you have to remember to start LibreVNA-GUI yourself before every session, and
+the server can only tell you that nothing is listening. With it, the server starts a
+headless GUI on demand and stops it again on exit — and still attaches to a GUI you
+already have open, so you can watch traces on screen when you want to.
+
+`--spawn` requires `--gui-path` (or `LIBREVNA_GUI_PATH`) and is refused without one, at
+argument parsing, before the server starts. It cannot start a GUI without knowing where
+one is, and left to run it would appear to work for exactly as long as some other GUI
+happened to be listening — then fail later, somewhere unrelated to the mistake.
 
 Add `--allow-emission` only when something is actually connected to the ports that you
 intend to drive.
@@ -151,7 +186,7 @@ intend to drive.
 | `--host` | `LIBREVNA_HOST` | `127.0.0.1` | Machine running LibreVNA-GUI |
 | `--port` | `LIBREVNA_PORT` | `19542` | SCPI port |
 | `--gui-path` | `LIBREVNA_GUI_PATH` | — | LibreVNA-GUI binary, for `--spawn` |
-| `--spawn` | `LIBREVNA_SPAWN` | off | Start a headless GUI if none is listening |
+| `--spawn` | `LIBREVNA_SPAWN` | off | Start a headless GUI if none is listening; requires `--gui-path` |
 | `--mock` | — | off | Serve a simulated instrument; no hardware needed |
 | `--workdir` | `LIBREVNA_WORKDIR` | cwd | Directory files are confined to |
 | `--max-stimulus-dbm` | `LIBREVNA_MAX_STIMULUS_DBM` | `-10` | Output power ceiling |

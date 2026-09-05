@@ -8,7 +8,7 @@ use clap::Parser;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
-use mcp_librevna::gui;
+use mcp_librevna::gui::GuiOptions;
 use mcp_librevna::mock::MockServer;
 use mcp_librevna::safety::{DEFAULT_MAX_STIMULUS_DBM, Policy};
 use mcp_librevna::scpi::client::DEFAULT_SCPI_PORT;
@@ -34,7 +34,11 @@ struct Cli {
     gui_path: Option<PathBuf>,
 
     /// Start a headless LibreVNA-GUI if none is already listening.
-    #[arg(long, env = "LIBREVNA_SPAWN")]
+    ///
+    /// Requires --gui-path (or LIBREVNA_GUI_PATH): --spawn without one cannot
+    /// start anything, and would otherwise look like it worked for as long as
+    /// some other GUI happened to be listening.
+    #[arg(long, env = "LIBREVNA_SPAWN", requires = "gui_path")]
     spawn: bool,
 
     /// Serve against a built-in simulated instrument. No hardware or GUI needed.
@@ -95,12 +99,11 @@ async fn main() -> anyhow::Result<()> {
         .with_manual_hardware(cli.allow_manual_hardware)
         .with_max_stimulus_dbm(cli.max_stimulus_dbm);
 
-    // Held for the lifetime of the process: dropping either would tear down the
+    // Held for the lifetime of the process: dropping it would tear down the
     // instrument this server is serving.
     let _mock_guard;
-    let _gui_guard;
 
-    let addr = if cli.mock {
+    let (addr, gui) = if cli.mock {
         let mock = MockServer::spawn().await?;
         let addr = mock.addr();
         tracing::warn!(
@@ -108,17 +111,25 @@ async fn main() -> anyhow::Result<()> {
             "serving a SIMULATED LibreVNA -- readings are synthetic, not measurements"
         );
         _mock_guard = mock;
-        addr
+        (addr, None)
     } else {
-        let addr = format!("{}:{}", cli.host, cli.port);
-        _gui_guard = gui::ensure_available(&addr, cli.gui_path.as_deref(), cli.spawn).await?;
-        addr
+        // Reaching the GUI is left to the first connect: failing here would
+        // exit before the MCP handshake, and the client would report only a
+        // closed connection instead of why the instrument is unavailable.
+        (
+            format!("{}:{}", cli.host, cli.port),
+            Some(GuiOptions {
+                path: cli.gui_path,
+                spawn: cli.spawn,
+            }),
+        )
     };
 
     let config = ServerConfig {
         addr,
         timeout: Duration::from_secs(cli.timeout_s),
         sweep_timeout: Duration::from_secs(cli.sweep_timeout_s),
+        gui,
     };
 
     tracing::info!(

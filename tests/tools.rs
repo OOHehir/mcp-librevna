@@ -31,6 +31,7 @@ async fn harness_with(configure: impl FnOnce(Policy) -> Policy) -> Harness {
         addr: mock.addr(),
         timeout: Duration::from_secs(5),
         sweep_timeout: Duration::from_secs(10),
+        gui: None,
     };
 
     let server = LibreVnaServer::new(config, policy);
@@ -69,6 +70,7 @@ async fn connect_reports_the_devices_own_limits() {
             addr: mock.addr(),
             timeout: Duration::from_secs(5),
             sweep_timeout: Duration::from_secs(10),
+            gui: None,
         },
         Policy::new(&workdir).unwrap(),
     );
@@ -484,6 +486,7 @@ async fn status_is_answerable_before_connecting() {
             addr: mock.addr(),
             timeout: Duration::from_secs(5),
             sweep_timeout: Duration::from_secs(10),
+            gui: None,
         },
         Policy::new(std::env::temp_dir()).unwrap(),
     );
@@ -538,4 +541,40 @@ async fn a_calibration_type_the_device_offers_is_activated() {
         .expect("a type the device offers should activate");
 
     assert_eq!(result.0.active.as_deref(), Some("SOLT_12"));
+}
+
+#[tokio::test]
+async fn a_missing_gui_is_reported_by_connect_rather_than_killing_the_server() {
+    // Regression: the GUI check used to run at startup, so an unreachable GUI
+    // exited the process before the MCP handshake and the client saw only a
+    // closed connection. The explanation has to survive as a tool error.
+    let dead = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().to_string()
+    };
+
+    let server = LibreVnaServer::new(
+        ServerConfig {
+            addr: dead,
+            timeout: Duration::from_secs(1),
+            sweep_timeout: Duration::from_secs(1),
+            gui: Some(mcp_librevna::gui::GuiOptions::default()),
+        },
+        Policy::new(std::env::temp_dir()).unwrap(),
+    );
+
+    // Tools unrelated to the instrument still answer.
+    assert!(!server.librevna_status().await.unwrap().0.connected);
+
+    let Err(err) = server
+        .librevna_connect(Parameters(ConnectArgs { serial: None }))
+        .await
+    else {
+        panic!("connect should fail when no GUI is listening");
+    };
+    let message = err.message.to_string();
+    assert!(
+        message.contains("not reachable") && message.contains("nothing is listening"),
+        "the reason must reach the agent, got: {message}"
+    );
 }

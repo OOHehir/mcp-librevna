@@ -18,6 +18,15 @@ use crate::error::{Result, VnaError};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const STARTUP_POLL: Duration = Duration::from_millis(250);
 
+/// How this server may obtain a GUI, when it is not talking to a mock.
+#[derive(Debug, Clone, Default)]
+pub struct GuiOptions {
+    /// Path to the LibreVNA-GUI binary, needed to start one.
+    pub path: Option<PathBuf>,
+    /// Whether starting a headless GUI is permitted at all.
+    pub spawn: bool,
+}
+
 /// A LibreVNA-GUI process started by this server, terminated when dropped.
 pub struct ManagedGui {
     child: Child,
@@ -117,7 +126,8 @@ pub async fn ensure_available(
     })
 }
 
-async fn is_listening(addr: &str) -> bool {
+/// Whether anything is accepting connections at `addr`.
+pub async fn is_listening(addr: &str) -> bool {
     matches!(
         tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr)).await,
         Ok(Ok(_))

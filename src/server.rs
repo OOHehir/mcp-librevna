@@ -26,6 +26,7 @@ use crate::autocal;
 use crate::calibration::{CalValidity, SweepConfig};
 use crate::device::{DeviceLimits, Mode, StatusFlags};
 use crate::error::{Tier, VnaError};
+use crate::gui::{self, GuiOptions, GuiSource};
 use crate::instrument::Instrument;
 use crate::librecal;
 use crate::safety::Policy;
@@ -49,6 +50,9 @@ pub struct ServerConfig {
     pub timeout: Duration,
     /// Budget for a sweep to complete, including averaging.
     pub sweep_timeout: Duration,
+    /// How to obtain the GUI serving `addr`, or `None` to never manage one --
+    /// which is what the mock and the tests want, since they listen themselves.
+    pub gui: Option<GuiOptions>,
 }
 
 impl Default for ServerConfig {
@@ -57,6 +61,7 @@ impl Default for ServerConfig {
             addr: format!("127.0.0.1:{}", crate::scpi::client::DEFAULT_SCPI_PORT),
             timeout: Duration::from_secs(10),
             sweep_timeout: Duration::from_secs(120),
+            gui: None,
         }
     }
 }
@@ -67,6 +72,8 @@ pub struct LibreVnaServer {
     config: ServerConfig,
     policy: Arc<Policy>,
     instrument: Arc<Mutex<Option<Instrument>>>,
+    /// A GUI this server started, held so that dropping the server stops it.
+    gui: Arc<Mutex<Option<GuiSource>>>,
 }
 
 fn mcp_err(e: VnaError) -> ErrorData {
@@ -486,7 +493,37 @@ impl LibreVnaServer {
             config,
             policy: Arc::new(policy),
             instrument: Arc::new(Mutex::new(None)),
+            gui: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Make sure a GUI is serving SCPI, starting one if that is configured.
+    ///
+    /// Deliberately deferred to connect time rather than done at startup: a
+    /// server that refuses to start reaches the client as a closed stdio pipe,
+    /// which says nothing about what is wrong. Reporting it from a tool call
+    /// puts the real reason in front of the agent, and lets a GUI started
+    /// afterwards be picked up without restarting this process.
+    async fn ensure_gui(&self) -> Result<(), VnaError> {
+        let Some(options) = self.config.gui.as_ref() else {
+            return Ok(());
+        };
+
+        let mut guard = self.gui.lock().await;
+        // A GUI we started may have died since; only the port proves otherwise.
+        if guard.is_some() && gui::is_listening(&self.config.addr).await {
+            return Ok(());
+        }
+        // Drop any corpse before starting a replacement, and note that this
+        // must happen before ensure_available: were it to attach to a GUI we
+        // already manage, storing the result would drop -- and so kill -- it.
+        *guard = None;
+
+        *guard = Some(
+            gui::ensure_available(&self.config.addr, options.path.as_deref(), options.spawn)
+                .await?,
+        );
+        Ok(())
     }
 
     fn enabled_tiers(&self) -> Vec<String> {
@@ -660,12 +697,16 @@ impl LibreVnaServer {
         description = "Connect to a LibreVNA through LibreVNA-GUI. Returns the unit's \
                        identity, the frequency/power/point limits it reports for itself, \
                        and which capability tiers this server was started with. Call this \
-                       before any other tool."
+                       before any other tool. When started with --spawn it also starts a \
+                       headless LibreVNA-GUI if none is running, which can take some \
+                       seconds on the first call."
     )]
     pub async fn librevna_connect(
         &self,
         Parameters(args): Parameters<ConnectArgs>,
     ) -> Result<Json<ConnectResult>, ErrorData> {
+        self.ensure_gui().await.map_err(mcp_err)?;
+
         let mut instrument = Instrument::connect(
             &self.config.addr,
             self.config.timeout,
