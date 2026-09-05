@@ -1017,28 +1017,19 @@ impl LibreVnaServer {
             .await
             .map_err(mcp_err)?;
 
-        // Block until the instrument reports the measurement finished.
-        let deadline = tokio::time::Instant::now() + self.config.sweep_timeout;
-        loop {
-            if !instrument
-                .query_bool("VNA:CAL:BUSY?")
-                .await
-                .map_err(mcp_err)?
-            {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(mcp_err(VnaError::Timeout(
-                    self.config.sweep_timeout,
-                    "VNA:CAL:BUSY?".into(),
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        // MEASURE only marks the entry pending; the next sweep fills it.
+        // `VNA:CAL:BUSY?` never reads true on a v1.6.5 GUI, so it is no handshake.
+        instrument
+            .run_sweep(self.config.sweep_timeout)
+            .await
+            .map_err(mcp_err)?;
 
         Ok(Json(Acknowledged {
             ok: true,
-            detail: format!("Measured {standard} as calibration entry {index}."),
+            detail: format!(
+                "Measured {standard} as calibration entry {index}. Leave the standard \
+                 connected until this returns."
+            ),
         }))
     }
 
