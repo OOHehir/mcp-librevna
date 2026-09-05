@@ -1,6 +1,6 @@
 [package]
 name = "mcp-librevna"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Model Context Protocol (MCP) server for the LibreVNA 100kHz-6GHz 2-port vector network analyser - sweeps, calibration, spectrum analysis and signal generation from an MCP client."

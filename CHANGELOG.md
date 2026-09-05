@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - LibreVNA-GUI is now reached on the first `librevna_connect` rather than at startup. An unreachable GUI used to exit the process before the MCP handshake, so the client reported only a closed connection and the reason was lost to stderr; it is now returned as a tool error naming the address and what to do about it
 - A GUI started later in the session is picked up by the next `librevna_connect`, and a `--spawn` GUI that has since died is replaced, neither needing the MCP server restarted
